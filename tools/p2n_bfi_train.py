@@ -114,19 +114,23 @@ def make_grad_scaler(torch, enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def build_model(nn, width: int, depth: int):
+def build_model(nn, width: int, depth: int, max_residual: float):
     class ResidualDenoiser(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             layers = [nn.Conv2d(1, width, 3, padding=1), nn.ReLU(inplace=True)]
             for _ in range(depth - 2):
                 layers.extend([nn.Conv2d(width, width, 3, padding=1), nn.ReLU(inplace=True)])
-            layers.append(nn.Conv2d(width, 1, 3, padding=1))
+            final = nn.Conv2d(width, 1, 3, padding=1)
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+            layers.append(final)
             self.net = nn.Sequential(*layers)
+            self.max_residual = float(max_residual)
 
         def forward(self, x):
-            noise = self.net(x)
-            return torch.clamp(x - noise, 0.0, 1.0)
+            noise = self.max_residual * torch.tanh(self.net(x))
+            return x - noise
 
     torch, _, _ = import_torch()
     return ResidualDenoiser()
@@ -156,6 +160,14 @@ def random_patch_batch(torch, arrays: list[np.ndarray], batch: int, patch: int, 
 def lp_loss(torch, pred, target, p: float, eps: float = 1e-6):
     diff = torch.abs(pred.float() - target.float()).clamp_min(eps)
     return torch.mean(torch.pow(diff, p))
+
+
+def gradient_l1(torch, pred, target) -> object:
+    pred = pred.float()
+    target = target.float()
+    dx = torch.mean(torch.abs((pred[..., :, 1:] - pred[..., :, :-1]) - (target[..., :, 1:] - target[..., :, :-1])))
+    dy = torch.mean(torch.abs((pred[..., 1:, :] - pred[..., :-1, :]) - (target[..., 1:, :] - target[..., :-1, :])))
+    return dx + dy
 
 
 def p_schedule(step: int, total: int) -> float:
@@ -198,6 +210,53 @@ def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: 
     return float(grad_norm.detach().cpu())
 
 
+def unwrap_model(nn, model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def save_artifacts(
+    torch,
+    nn,
+    model,
+    args: argparse.Namespace,
+    state: TransformState,
+    input_paths: list[Path],
+    arrays: list[np.ndarray],
+    history: list[dict[str, float]],
+    tag: str,
+) -> None:
+    out_dir = args.out if tag == "final" else args.out / "checkpoints"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "" if tag == "final" else f"_{tag}"
+
+    checkpoint = {
+        "model": unwrap_model(nn, model).state_dict(),
+        "args": vars(args),
+        "transform": asdict(state),
+        "inputs": [str(p) for p in input_paths],
+        "history": history,
+    }
+    torch.save(checkpoint, out_dir / f"p2n_bfi_model{suffix}.pt")
+    (out_dir / f"metadata{suffix}.json").write_text(
+        json.dumps({k: v for k, v in checkpoint.items() if k != "model"}, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for path, arr in zip(input_paths, arrays):
+            tensor = torch.from_numpy(arr[None, None, :, :]).to(device=args.device)
+            den = model(tensor).detach().cpu().numpy()[0, 0]
+            den = np.clip(den, 0.0, 1.0)
+            den_raw = inverse_transform(den, state).astype(np.float32)
+            name_suffix = "p2n_denoised" if tag == "final" else f"p2n_{tag}"
+            np.save(out_dir / f"{path.stem}_{name_suffix}.npy", den_raw)
+            save_preview_png(out_dir / f"{path.stem}_{name_suffix}.png", den_raw)
+    if was_training:
+        model.train()
+
+
 def train(args: argparse.Namespace) -> None:
     torch, nn, _ = import_torch()
     if args.device == "auto":
@@ -212,9 +271,10 @@ def train(args: argparse.Namespace) -> None:
 
     input_paths = expand_inputs(args.inputs)
     arrays, state = load_and_normalize(input_paths, args.transform)
+    data_mean = float(np.mean(np.concatenate([arr.ravel() for arr in arrays])))
     args.out.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(nn, args.width, args.depth).to(args.device)
+    model = build_model(nn, args.width, args.depth, args.max_residual).to(args.device)
     if args.data_parallel:
         if use_cuda and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -260,6 +320,7 @@ def train(args: argparse.Namespace) -> None:
         y = random_patch_batch(torch, arrays, args.batch_size, args.patch_size, args.device)
         with torch.no_grad():
             x_hat = model(y)
+            x_hat = torch.clamp(x_hat, 0.0, 1.0)
             n_hat = y - x_hat
             sigma_p = coeff_like(torch, y, args.rdc_sigma, args.coeff_mode)
             sigma_n = coeff_like(torch, y, args.rdc_sigma, args.coeff_mode)
@@ -270,16 +331,31 @@ def train(args: argparse.Namespace) -> None:
             out_pos = model(y_pos)
             out_neg = model(y_neg)
             p = p_schedule(step, args.p2n_steps)
-            loss = lp_loss(torch, out_pos, out_neg, p)
+            dcs_loss = lp_loss(torch, out_pos, out_neg, p)
+            loss = dcs_loss
 
-            if args.anchor_weight > 0:
+            pred_y = model(y)
+            with torch.no_grad():
+                teacher_y = teacher(y) if args.anchor_target == "teacher" else y
+
+            anchor_weight = 0.0
+            if args.anchor_weight > 0 or args.anchor_floor > 0:
                 anchor_t = min(1.0, step / float(max(1, args.anchor_decay_steps)))
-                weight = args.anchor_weight * (1.0 - anchor_t)
-                if weight > 0:
-                    anchor_pred = model(y)
-                    with torch.no_grad():
-                        anchor_target = teacher(y) if args.anchor_target == "teacher" else y
-                    loss = loss + weight * lp_loss(torch, anchor_pred, anchor_target, p)
+                anchor_weight = args.anchor_floor + max(0.0, args.anchor_weight - args.anchor_floor) * (1.0 - anchor_t)
+                if anchor_weight > 0:
+                    loss = loss + anchor_weight * lp_loss(torch, pred_y, teacher_y, p)
+
+            noise_std = torch.std((y - pred_y).float().flatten(1), dim=1).mean()
+            if args.noise_floor_weight > 0 and args.noise_floor > 0:
+                loss = loss + args.noise_floor_weight * torch.relu(args.noise_floor - noise_std).pow(2)
+
+            pred_mean = pred_y.float().mean()
+            mean_floor = args.black_floor_ratio * data_mean
+            if args.black_floor_weight > 0 and mean_floor > 0:
+                loss = loss + args.black_floor_weight * torch.relu(mean_floor - pred_mean).pow(2)
+
+            if args.edge_weight > 0:
+                loss = loss + args.edge_weight * gradient_l1(torch, pred_y, teacher_y)
 
         try:
             grad_norm = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
@@ -293,37 +369,33 @@ def train(args: argparse.Namespace) -> None:
                 "phase": 1.0,
                 "step": float(step + 1),
                 "loss": float(loss.detach().cpu()),
+                "dcs_loss": float(dcs_loss.detach().cpu()),
                 "p": p,
                 "grad_norm": grad_norm,
+                "anchor_weight": float(anchor_weight),
+                "noise_std": float(noise_std.detach().cpu()),
+                "pred_mean": float(pred_mean.detach().cpu()),
             }
             history.append(item)
             print(
                 f"p2n {step + 1}/{args.p2n_steps} "
-                f"p={p:.3f} loss={item['loss']:.6f} grad={grad_norm:.3f}"
+                f"p={p:.3f} loss={item['loss']:.6f} dcs={item['dcs_loss']:.6f} "
+                f"noise={item['noise_std']:.4f} mean={item['pred_mean']:.4f} grad={grad_norm:.3f}"
+            )
+        if args.save_every > 0 and (step + 1) % args.save_every == 0:
+            save_artifacts(
+                torch,
+                nn,
+                model,
+                args,
+                state,
+                input_paths,
+                arrays,
+                history,
+                tag=f"step{step + 1}",
             )
 
-    checkpoint = {
-        "model": (model.module if isinstance(model, nn.DataParallel) else model).state_dict(),
-        "args": vars(args),
-        "transform": asdict(state),
-        "inputs": [str(p) for p in input_paths],
-        "history": history,
-    }
-    torch.save(checkpoint, args.out / "p2n_bfi_model.pt")
-    (args.out / "metadata.json").write_text(
-        json.dumps({k: v for k, v in checkpoint.items() if k != "model"}, indent=2, default=str),
-        encoding="utf-8",
-    )
-
-    model.eval()
-    with torch.no_grad():
-        for path, arr in zip(input_paths, arrays):
-            tensor = torch.from_numpy(arr[None, None, :, :]).to(device=args.device)
-            den = model(tensor).detach().cpu().numpy()[0, 0]
-            den_raw = inverse_transform(den, state).astype(np.float32)
-            stem = path.stem
-            np.save(args.out / f"{stem}_p2n_denoised.npy", den_raw)
-            save_preview_png(args.out / f"{stem}_p2n_denoised.png", den_raw)
+    save_artifacts(torch, nn, model, args, state, input_paths, arrays, history, tag="final")
 
 
 def parse_args() -> argparse.Namespace:
@@ -336,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transform", choices=["sqrt", "log1p", "none"], default="sqrt")
     parser.add_argument("--width", type=int, default=48)
     parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--max-residual", type=float, default=0.35)
     parser.add_argument("--patch-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -351,8 +424,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rdc-sigma", type=float, default=0.2)
     parser.add_argument("--coeff-mode", choices=["pixel", "patch"], default="pixel")
     parser.add_argument("--anchor-weight", type=float, default=0.05)
+    parser.add_argument("--anchor-floor", type=float, default=0.005)
     parser.add_argument("--anchor-decay-steps", type=int, default=500)
     parser.add_argument("--anchor-target", choices=["teacher", "input"], default="teacher")
+    parser.add_argument("--noise-floor", type=float, default=0.02)
+    parser.add_argument("--noise-floor-weight", type=float, default=0.2)
+    parser.add_argument("--black-floor-ratio", type=float, default=0.25)
+    parser.add_argument("--black-floor-weight", type=float, default=0.1)
+    parser.add_argument("--edge-weight", type=float, default=0.02)
+    parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision.")
     parser.add_argument("--data-parallel", action="store_true", help="Use torch.nn.DataParallel when multiple CUDA GPUs are visible.")
