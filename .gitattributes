@@ -1,0 +1,4 @@
+*.npy binary
+*.pt binary
+*.pth binary
+*.ckpt binary
