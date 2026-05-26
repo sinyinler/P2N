@@ -1,10 +1,12 @@
 # P2N-BFI single-frame denoising
 
-This workspace now contains two runnable entry points:
+This workspace now contains several runnable entry points:
 
 - `tools/analyze_bfi_noise.py`: checks the two BFI frames for spatial correlation, noise symmetry, signal-dependent variance, and the limits of temporal-correlation estimation.
 - `tools/blind_baseline_bfi.py`: runs training-free blind-pixel baselines, including 4-neighbor mean, 8-neighbor mean, 8-neighbor median, 5x5 ring mean, and directional pair mean.
 - `tools/p2n_bfi_train.py`: a PyTorch P2N-style trainer for `.npy` BFI images with Gaussian pretraining, RDC/DCS fine-tuning, progressive `p=2->1.5` loss, pixel-wise re-noising coefficients, optional `sqrt/log1p` variance stabilization, CUDA AMP, optional multi-GPU `DataParallel`, and a decayed teacher anchor.
+- `tools/pixel2pixel_bfi_matchcheck.py`: validates whether Pixel2Pixel's pixel bank is matching similar underlying BFI signal rather than noise coincidences.
+- `tools/pixel2pixel_bfi_train.py`: builds a non-local pixel bank from a single BFI image, samples pseudo Noise2Noise pairs, and trains a normal image-to-image CNN with MSE in the log1p/VST domain.
 
 Install dependencies:
 
@@ -22,6 +24,26 @@ Run the training-free blind baselines:
 
 ```powershell
 python tools/blind_baseline_bfi.py --inputs dataset/*.npy --out runs/blind_baselines
+```
+
+Run the Pixel2Pixel match-quality gate when you have an approximate clean/long-window GT:
+
+```powershell
+python tools/pixel2pixel_bfi_matchcheck.py --noisy dataset/0_nonoverlap.npy --gt path/to/long_window_gt.npy --out reports/pixel2pixel_matchcheck
+```
+
+Use `--transform log1p` for the main multiplicative-noise setting. `--transform sqrt` is still useful as an ablation because it can produce tighter pixel-bank matches on some BFI frames.
+
+Train Pixel2Pixel pseudo-N2N denoising:
+
+```powershell
+python tools/pixel2pixel_bfi_train.py --inputs dataset/0_nonoverlap.npy --out runs/pixel2pixel_bfi --transform log1p --bank-size 32 --bank-patch-size 7 --train-patch-size 96 --steps 8000
+```
+
+For two 24 GB GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python tools/pixel2pixel_bfi_train.py --inputs "dataset/*.npy" --out runs/pixel2pixel_bfi_a5000 --transform log1p --bank-size 32 --bank-patch-size 7 --match-sigma 0.8 --exclude-radius auto --width 64 --depth 5 --max-residual 0.35 --train-patch-size 128 --batch-size 64 --steps 8000 --lr 0.0003 --grad-clip 1.0 --save-every 500 --amp --data-parallel
 ```
 
 Train after installing PyTorch:
