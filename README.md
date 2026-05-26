@@ -44,6 +44,7 @@ python tools/p2n_bfi_train.py \
   --batch-size 64 \
   --p2n-lr 0.00005 \
   --grad-clip 1.0 \
+  --max-consecutive-skips 20 \
   --pretrain-steps 3000 \
   --p2n-steps 8000 \
   --rdc-sigma 0.15 \

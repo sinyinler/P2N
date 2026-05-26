@@ -187,9 +187,10 @@ def coeff_like(torch, y, std: float, mode: str):
     return torch.clamp(coeff, min=0.0)
 
 
-def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: float) -> float:
+def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: float) -> tuple[float, bool]:
     if not torch.isfinite(loss.detach()):
-        raise FloatingPointError("Non-finite loss before backward.")
+        optimizer.zero_grad(set_to_none=True)
+        return float("nan"), True
 
     optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -201,13 +202,13 @@ def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: 
         if not torch.isfinite(grad_norm):
             optimizer.zero_grad(set_to_none=True)
             scaler.update()
-            raise FloatingPointError(f"Non-finite gradient norm: {float(grad_norm.detach().cpu())}")
+            return float(grad_norm.detach().cpu()), True
 
     scaler.step(optimizer)
     scaler.update()
     if grad_norm is None:
-        return float("nan")
-    return float(grad_norm.detach().cpu())
+        return float("nan"), False
+    return float(grad_norm.detach().cpu()), False
 
 
 def unwrap_model(nn, model):
@@ -285,6 +286,7 @@ def train(args: argparse.Namespace) -> None:
     scaler = make_grad_scaler(torch, use_amp)
 
     history: list[dict[str, float]] = []
+    consecutive_skips = 0
     model.train()
     for step in range(args.pretrain_steps):
         clean = random_patch_batch(torch, arrays, args.batch_size, args.patch_size, args.device)
@@ -295,18 +297,22 @@ def train(args: argparse.Namespace) -> None:
         with cuda_autocast(torch, use_amp):
             pred = model(noisy)
             loss = lp_loss(torch, pred, clean, 2.0)
-        grad_norm = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
+        grad_norm, skipped = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
+        consecutive_skips = consecutive_skips + 1 if skipped else 0
+        if consecutive_skips > args.max_consecutive_skips:
+            raise FloatingPointError(f"Pretraining had {consecutive_skips} consecutive skipped optimizer steps.")
         if (step + 1) % args.log_every == 0 or step == 0:
             item = {
                 "phase": 0.0,
                 "step": float(step + 1),
                 "loss": float(loss.detach().cpu()),
                 "grad_norm": grad_norm,
+                "skipped": float(skipped),
             }
             history.append(item)
             print(
                 f"pretrain {step + 1}/{args.pretrain_steps} "
-                f"loss={item['loss']:.6f} grad={grad_norm:.3f}"
+                f"loss={item['loss']:.6f} grad={grad_norm:.3f} skipped={int(skipped)}"
             )
 
     teacher = copy.deepcopy(model).eval()
@@ -315,6 +321,7 @@ def train(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.p2n_lr, weight_decay=args.weight_decay)
     scaler = make_grad_scaler(torch, use_amp)
+    consecutive_skips = 0
 
     for step in range(args.p2n_steps):
         y = random_patch_batch(torch, arrays, args.batch_size, args.patch_size, args.device)
@@ -357,13 +364,13 @@ def train(args: argparse.Namespace) -> None:
             if args.edge_weight > 0:
                 loss = loss + args.edge_weight * gradient_l1(torch, pred_y, teacher_y)
 
-        try:
-            grad_norm = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
-        except FloatingPointError as exc:
+        grad_norm, skipped = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
+        consecutive_skips = consecutive_skips + 1 if skipped else 0
+        if consecutive_skips > args.max_consecutive_skips:
             raise FloatingPointError(
-                f"{exc} P2N became unstable at step {step + 1}. "
+                f"P2N had {consecutive_skips} consecutive skipped optimizer steps at step {step + 1}. "
                 "Try rerunning with a lower --p2n-lr, lower --rdc-sigma, or without --amp."
-            ) from exc
+            )
         if (step + 1) % args.log_every == 0 or step == 0:
             item = {
                 "phase": 1.0,
@@ -375,12 +382,14 @@ def train(args: argparse.Namespace) -> None:
                 "anchor_weight": float(anchor_weight),
                 "noise_std": float(noise_std.detach().cpu()),
                 "pred_mean": float(pred_mean.detach().cpu()),
+                "skipped": float(skipped),
             }
             history.append(item)
             print(
                 f"p2n {step + 1}/{args.p2n_steps} "
                 f"p={p:.3f} loss={item['loss']:.6f} dcs={item['dcs_loss']:.6f} "
-                f"noise={item['noise_std']:.4f} mean={item['pred_mean']:.4f} grad={grad_norm:.3f}"
+                f"noise={item['noise_std']:.4f} mean={item['pred_mean']:.4f} "
+                f"grad={grad_norm:.3f} skipped={int(skipped)}"
             )
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
             save_artifacts(
@@ -412,16 +421,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--p2n-lr", type=float, default=1e-4)
+    parser.add_argument("--p2n-lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--max-consecutive-skips", type=int, default=20)
 
     parser.add_argument("--pretrain-steps", type=int, default=1000)
     parser.add_argument("--gaussian-sigma-min", type=float, default=0.02)
     parser.add_argument("--gaussian-sigma-max", type=float, default=0.12)
 
     parser.add_argument("--p2n-steps", type=int, default=3000)
-    parser.add_argument("--rdc-sigma", type=float, default=0.2)
+    parser.add_argument("--rdc-sigma", type=float, default=0.15)
     parser.add_argument("--coeff-mode", choices=["pixel", "patch"], default="pixel")
     parser.add_argument("--anchor-weight", type=float, default=0.05)
     parser.add_argument("--anchor-floor", type=float, default=0.005)
