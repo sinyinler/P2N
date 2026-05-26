@@ -99,6 +99,21 @@ def import_torch():
     return torch, nn, F
 
 
+def cuda_autocast(torch, enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def make_grad_scaler(torch, enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def build_model(nn, width: int, depth: int):
     class ResidualDenoiser(nn.Module):
         def __init__(self) -> None:
@@ -139,7 +154,8 @@ def random_patch_batch(torch, arrays: list[np.ndarray], batch: int, patch: int, 
 
 
 def lp_loss(torch, pred, target, p: float, eps: float = 1e-6):
-    return torch.mean(torch.pow(torch.abs(pred - target) + eps, p))
+    diff = torch.abs(pred.float() - target.float()).clamp_min(eps)
+    return torch.mean(torch.pow(diff, p))
 
 
 def p_schedule(step: int, total: int) -> float:
@@ -157,6 +173,29 @@ def coeff_like(torch, y, std: float, mode: str):
     else:
         raise ValueError(f"Unknown coefficient mode: {mode}")
     return torch.clamp(coeff, min=0.0)
+
+
+def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: float) -> float:
+    if not torch.isfinite(loss.detach()):
+        raise FloatingPointError("Non-finite loss before backward.")
+
+    optimizer.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+
+    grad_norm = None
+    if grad_clip > 0:
+        scaler.unscale_(optimizer)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if not torch.isfinite(grad_norm):
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            raise FloatingPointError(f"Non-finite gradient norm: {float(grad_norm.detach().cpu())}")
+
+    scaler.step(optimizer)
+    scaler.update()
+    if grad_norm is None:
+        return float("nan")
+    return float(grad_norm.detach().cpu())
 
 
 def train(args: argparse.Namespace) -> None:
@@ -183,7 +222,7 @@ def train(args: argparse.Namespace) -> None:
         else:
             print("DataParallel requested, but fewer than two CUDA devices are available; using one device")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = make_grad_scaler(torch, use_amp)
 
     history: list[dict[str, float]] = []
     model.train()
@@ -193,21 +232,29 @@ def train(args: argparse.Namespace) -> None:
             args.gaussian_sigma_min, args.gaussian_sigma_max
         )
         noisy = torch.clamp(clean + sigma * torch.randn_like(clean), 0.0, 1.0)
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with cuda_autocast(torch, use_amp):
             pred = model(noisy)
             loss = lp_loss(torch, pred, clean, 2.0)
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        grad_norm = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
         if (step + 1) % args.log_every == 0 or step == 0:
-            item = {"phase": 0.0, "step": float(step + 1), "loss": float(loss.detach().cpu())}
+            item = {
+                "phase": 0.0,
+                "step": float(step + 1),
+                "loss": float(loss.detach().cpu()),
+                "grad_norm": grad_norm,
+            }
             history.append(item)
-            print(f"pretrain {step + 1}/{args.pretrain_steps} loss={item['loss']:.6f}")
+            print(
+                f"pretrain {step + 1}/{args.pretrain_steps} "
+                f"loss={item['loss']:.6f} grad={grad_norm:.3f}"
+            )
 
     teacher = copy.deepcopy(model).eval()
     for param in teacher.parameters():
         param.requires_grad_(False)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.p2n_lr, weight_decay=args.weight_decay)
+    scaler = make_grad_scaler(torch, use_amp)
 
     for step in range(args.p2n_steps):
         y = random_patch_batch(torch, arrays, args.batch_size, args.patch_size, args.device)
@@ -219,7 +266,7 @@ def train(args: argparse.Namespace) -> None:
             y_pos = torch.clamp(x_hat + sigma_n * n_hat, 0.0, 1.0)
             y_neg = torch.clamp(x_hat - sigma_p * n_hat, 0.0, 1.0)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with cuda_autocast(torch, use_amp):
             out_pos = model(y_pos)
             out_neg = model(y_neg)
             p = p_schedule(step, args.p2n_steps)
@@ -234,19 +281,26 @@ def train(args: argparse.Namespace) -> None:
                         anchor_target = teacher(y) if args.anchor_target == "teacher" else y
                     loss = loss + weight * lp_loss(torch, anchor_pred, anchor_target, p)
 
-        optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        try:
+            grad_norm = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
+        except FloatingPointError as exc:
+            raise FloatingPointError(
+                f"{exc} P2N became unstable at step {step + 1}. "
+                "Try rerunning with a lower --p2n-lr, lower --rdc-sigma, or without --amp."
+            ) from exc
         if (step + 1) % args.log_every == 0 or step == 0:
             item = {
                 "phase": 1.0,
                 "step": float(step + 1),
                 "loss": float(loss.detach().cpu()),
                 "p": p,
+                "grad_norm": grad_norm,
             }
             history.append(item)
-            print(f"p2n {step + 1}/{args.p2n_steps} p={p:.3f} loss={item['loss']:.6f}")
+            print(
+                f"p2n {step + 1}/{args.p2n_steps} "
+                f"p={p:.3f} loss={item['loss']:.6f} grad={grad_norm:.3f}"
+            )
 
     checkpoint = {
         "model": (model.module if isinstance(model, nn.DataParallel) else model).state_dict(),
@@ -285,7 +339,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--p2n-lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
 
     parser.add_argument("--pretrain-steps", type=int, default=1000)
     parser.add_argument("--gaussian-sigma-min", type=float, default=0.02)

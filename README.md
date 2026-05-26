@@ -34,6 +34,8 @@ python tools/p2n_bfi_train.py \
   --depth 10 \
   --patch-size 128 \
   --batch-size 64 \
+  --p2n-lr 0.0001 \
+  --grad-clip 1.0 \
   --pretrain-steps 3000 \
   --p2n-steps 8000 \
   --rdc-sigma 0.2 \
