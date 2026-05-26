@@ -56,8 +56,8 @@ def make_grad_scaler(torch, enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def build_model(nn, width: int, depth: int, max_residual: float):
-    """A small ordinary image-to-image residual CNN, not a blind-spot network."""
+def build_rescnn(nn, width: int, depth: int, max_residual: float):
+    """A small ordinary residual CNN kept as an ablation baseline."""
 
     class ResidualCNN(nn.Module):
         def __init__(self) -> None:
@@ -80,6 +80,79 @@ def build_model(nn, width: int, depth: int, max_residual: float):
             return x - residual
 
     return ResidualCNN()
+
+
+def build_unet(nn, width: int, levels: int, max_residual: float):
+    """A compact U-Net that can see the center pixel and preserve vascular edges."""
+
+    class ConvBlock(nn.Module):
+        def __init__(self, in_ch: int, out_ch: int) -> None:
+            super().__init__()
+            self.block = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                nn.ReLU(inplace=True),
+            )
+
+        def forward(self, x):
+            return self.block(x)
+
+    class ResidualUNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            channels = [width * (2**i) for i in range(levels)]
+            self.down_blocks = nn.ModuleList()
+            in_ch = 1
+            for out_ch in channels:
+                self.down_blocks.append(ConvBlock(in_ch, out_ch))
+                in_ch = out_ch
+
+            self.pool = nn.MaxPool2d(2)
+            self.bottleneck = ConvBlock(channels[-1], channels[-1] * 2)
+
+            self.up_blocks = nn.ModuleList()
+            decoder_in = channels[-1] * 2
+            for skip_ch in reversed(channels):
+                self.up_blocks.append(ConvBlock(decoder_in + skip_ch, skip_ch))
+                decoder_in = skip_ch
+
+            self.final = nn.Conv2d(channels[0], 1, 1)
+            nn.init.zeros_(self.final.weight)
+            nn.init.zeros_(self.final.bias)
+            self.tanh = nn.Tanh()
+            self.max_residual = float(max_residual)
+
+        def forward(self, x):
+            import torch
+            import torch.nn.functional as F
+
+            skips = []
+            out = x
+            for block in self.down_blocks:
+                out = block(out)
+                skips.append(out)
+                out = self.pool(out)
+
+            out = self.bottleneck(out)
+            for block, skip in zip(self.up_blocks, reversed(skips)):
+                # Use explicit target size so odd BFI dimensions also work at inference.
+                out = F.interpolate(out, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+                out = torch.cat([out, skip], dim=1)
+                out = block(out)
+
+            residual = self.max_residual * self.tanh(self.final(out))
+            return x - residual
+
+    return ResidualUNet()
+
+
+def build_model(nn, model_name: str, width: int, depth: int, unet_levels: int, max_residual: float):
+    if model_name == "rescnn":
+        return build_rescnn(nn, width, depth, max_residual)
+    if model_name == "unet":
+        return build_unet(nn, width, unet_levels, max_residual)
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 def unwrap_model(nn, model):
@@ -106,6 +179,72 @@ def finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, grad_clip: 
     scaler.step(optimizer)
     scaler.update()
     return (float("nan") if grad_norm is None else float(grad_norm.detach().cpu())), False
+
+
+def gaussian_kernel_2d(torch, radius: int, sigma: float, device, dtype):
+    """Create the Gaussian window used by RTV."""
+
+    ksize = 2 * int(radius) + 1
+    axis = torch.arange(ksize, device=device, dtype=dtype) - float(radius)
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    kernel = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+    return kernel / (kernel.sum() + 1e-12)
+
+
+def charbonnier_loss(torch, pred, target, eps: float):
+    """Charbonnier data term from the referenced implementation."""
+
+    diff = pred.float() - target.float()
+    return torch.mean(torch.sqrt(diff * diff + eps * eps))
+
+
+def rtv_regularizer(torch, F, x, radius: int = 2, sigma: float = 2.0, eps: float = 1e-3):
+    """Relative total variation regularizer.
+
+    This follows the RTV loss you provided: windowed total variation divided by
+    windowed inherent variation. It suppresses fine texture/noise while keeping
+    coherent large-scale edges, which is useful for BFI vessel boundaries.
+    """
+
+    x = x.float()
+    if x.dim() == 3:
+        x = x.unsqueeze(1)
+
+    dx = x[..., :, 1:] - x[..., :, :-1]
+    dx = F.pad(dx, (0, 1, 0, 0), mode="replicate")
+    dy = x[..., 1:, :] - x[..., :-1, :]
+    dy = F.pad(dy, (0, 0, 0, 1), mode="replicate")
+
+    channels = x.shape[1]
+    kernel = gaussian_kernel_2d(torch, radius, sigma, x.device, x.dtype)
+    kernel = kernel.unsqueeze(0).unsqueeze(0)
+    weight = kernel.expand(channels, 1, kernel.shape[-2], kernel.shape[-1]).contiguous()
+
+    wtv_x = F.conv2d(dx.abs(), weight, padding=radius, groups=channels)
+    wtv_y = F.conv2d(dy.abs(), weight, padding=radius, groups=channels)
+    wiv_x = F.conv2d(dx, weight, padding=radius, groups=channels).abs()
+    wiv_y = F.conv2d(dy, weight, padding=radius, groups=channels).abs()
+    return (wtv_x / (wiv_x + eps) + wtv_y / (wiv_y + eps)).mean()
+
+
+def compute_training_loss(torch, F, pred, target, args: argparse.Namespace) -> tuple[object, dict[str, float]]:
+    """Compute the selected Pixel2Pixel training loss in FP32."""
+
+    if args.loss == "mse":
+        mse = F.mse_loss(pred.float(), target.float())
+        return mse, {"mse": float(mse.detach().cpu())}
+
+    if args.loss == "charbonnier_rtv":
+        charb = charbonnier_loss(torch, pred, target, args.charbonnier_eps)
+        rtv = rtv_regularizer(torch, F, pred, radius=args.rtv_radius, sigma=args.rtv_sigma, eps=args.rtv_eps)
+        loss = charb + args.rtv_weight * rtv
+        return loss, {
+            "charbonnier": float(charb.detach().cpu()),
+            "rtv": float(rtv.detach().cpu()),
+            "rtv_weighted": float((args.rtv_weight * rtv).detach().cpu()),
+        }
+
+    raise ValueError(f"Unknown loss: {args.loss}")
 
 
 def infer_full_image(torch, model, image: np.ndarray, device: str) -> np.ndarray:
@@ -297,7 +436,7 @@ def train(args: argparse.Namespace) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     items = [build_bank_for_image(args, path, image) for path, image in zip(input_paths, images)]
 
-    model = build_model(nn, args.width, args.depth, args.max_residual).to(args.device)
+    model = build_model(nn, args.model, args.width, args.depth, args.unet_levels, args.max_residual).to(args.device)
     if args.data_parallel:
         if use_cuda and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -315,8 +454,7 @@ def train(args: argparse.Namespace) -> None:
         x, y = sample_pseudo_n2n_batch(torch, items, args.batch_size, args.train_patch_size, args.device, rng)
         with cuda_autocast(torch, use_amp):
             pred = model(x)
-            # Pixel2Pixel/N2N theory uses L2 when noise is approximately zero-mean.
-            loss = F.mse_loss(pred.float(), y.float())
+        loss, loss_parts = compute_training_loss(torch, F, pred, y, args)
 
         grad_norm, skipped = finish_optimizer_step(torch, nn, model, optimizer, scaler, loss, args.grad_clip)
         consecutive_skips = consecutive_skips + 1 if skipped else 0
@@ -332,12 +470,11 @@ def train(args: argparse.Namespace) -> None:
                 "loss": float(loss.detach().cpu()),
                 "grad_norm": grad_norm,
                 "skipped": float(skipped),
+                **loss_parts,
             }
             history.append(item)
-            print(
-                f"step {step + 1}/{args.steps} "
-                f"mse={item['loss']:.6f} grad={grad_norm:.3f} skipped={int(skipped)}"
-            )
+            loss_text = " ".join(f"{key}={value:.6f}" for key, value in loss_parts.items())
+            print(f"step {step + 1}/{args.steps} loss={item['loss']:.6f} {loss_text} grad={grad_norm:.3f} skipped={int(skipped)}")
 
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
             save_artifacts(torch, nn, model, args, state, items, history, tag=f"step{step + 1}")
@@ -371,8 +508,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=-1)
     parser.add_argument("--reuse-bank", action="store_true")
 
-    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--model", choices=["unet", "rescnn"], default="unet")
+    parser.add_argument("--width", type=int, default=32)
     parser.add_argument("--depth", type=int, default=5)
+    parser.add_argument("--unet-levels", type=int, default=3)
     parser.add_argument("--max-residual", type=float, default=0.35)
     parser.add_argument("--train-patch-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -381,6 +520,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-consecutive-skips", type=int, default=20)
+    parser.add_argument("--loss", choices=["charbonnier_rtv", "mse"], default="charbonnier_rtv")
+    parser.add_argument("--charbonnier-eps", type=float, default=1e-3)
+    parser.add_argument("--rtv-weight", type=float, default=0.01)
+    parser.add_argument("--rtv-radius", type=int, default=2)
+    parser.add_argument("--rtv-sigma", type=float, default=2.0)
+    parser.add_argument("--rtv-eps", type=float, default=1e-3)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--save-every", type=int, default=500)

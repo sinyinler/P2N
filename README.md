@@ -6,7 +6,7 @@ This workspace now contains several runnable entry points:
 - `tools/blind_baseline_bfi.py`: runs training-free blind-pixel baselines, including 4-neighbor mean, 8-neighbor mean, 8-neighbor median, 5x5 ring mean, and directional pair mean.
 - `tools/p2n_bfi_train.py`: a PyTorch P2N-style trainer for `.npy` BFI images with Gaussian pretraining, RDC/DCS fine-tuning, progressive `p=2->1.5` loss, pixel-wise re-noising coefficients, optional `sqrt/log1p` variance stabilization, CUDA AMP, optional multi-GPU `DataParallel`, and a decayed teacher anchor.
 - `tools/pixel2pixel_bfi_matchcheck.py`: validates whether Pixel2Pixel's pixel bank is matching similar underlying BFI signal rather than noise coincidences.
-- `tools/pixel2pixel_bfi_train.py`: builds a non-local pixel bank from a single BFI image, samples pseudo Noise2Noise pairs, and trains a normal image-to-image CNN with MSE in the log1p/VST domain.
+- `tools/pixel2pixel_bfi_train.py`: builds a non-local pixel bank from a single BFI image, samples pseudo Noise2Noise pairs, and trains a normal image-to-image U-Net with `Charbonnier + 0.01 * RTV` in the log1p/VST domain.
 
 Install dependencies:
 
@@ -37,13 +37,13 @@ Use `--transform log1p` for the main multiplicative-noise setting. `--transform 
 Train Pixel2Pixel pseudo-N2N denoising:
 
 ```powershell
-python tools/pixel2pixel_bfi_train.py --inputs dataset/0_nonoverlap.npy --out runs/pixel2pixel_bfi --transform log1p --bank-size 32 --bank-patch-size 7 --train-patch-size 96 --steps 8000
+python tools/pixel2pixel_bfi_train.py --inputs dataset/0_nonoverlap.npy --out runs/pixel2pixel_bfi --transform log1p --model unet --loss charbonnier_rtv --bank-size 32 --bank-patch-size 7 --train-patch-size 96 --steps 8000
 ```
 
 For two 24 GB GPUs:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python tools/pixel2pixel_bfi_train.py --inputs "dataset/*.npy" --out runs/pixel2pixel_bfi_a5000 --transform log1p --bank-size 32 --bank-patch-size 7 --match-sigma 0.8 --exclude-radius auto --width 64 --depth 5 --max-residual 0.35 --train-patch-size 128 --batch-size 64 --steps 8000 --lr 0.0003 --grad-clip 1.0 --save-every 500 --amp --data-parallel
+CUDA_VISIBLE_DEVICES=0,1 python tools/pixel2pixel_bfi_train.py --inputs "dataset/*.npy" --out runs/pixel2pixel_bfi_a5000_unet_rtv --transform log1p --bank-size 32 --bank-patch-size 7 --match-sigma 0.8 --exclude-radius auto --model unet --width 32 --unet-levels 3 --max-residual 0.35 --train-patch-size 128 --batch-size 32 --steps 8000 --lr 0.0003 --loss charbonnier_rtv --rtv-weight 0.01 --rtv-sigma 2 --rtv-radius 2 --grad-clip 1.0 --save-every 500 --amp --data-parallel --reuse-bank
 ```
 
 Train after installing PyTorch:
