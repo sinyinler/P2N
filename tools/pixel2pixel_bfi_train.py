@@ -70,12 +70,13 @@ def build_model(nn, width: int, depth: int, max_residual: float):
             nn.init.zeros_(final.bias)
             layers.append(final)
             self.net = nn.Sequential(*layers)
+            self.tanh = nn.Tanh()
             self.max_residual = float(max_residual)
 
         def forward(self, x):
             # Bound the predicted residual so early training cannot jump to a
             # pathological all-black/all-white solution.
-            residual = self.max_residual * torch.tanh(self.net(x))
+            residual = self.max_residual * self.tanh(self.net(x))
             return x - residual
 
     return ResidualCNN()
