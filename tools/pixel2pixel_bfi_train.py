@@ -16,6 +16,7 @@ from pixel2pixel_bfi_common import (
     extract_pixel_features,
     fit_vst_normalization,
     query_pixel_bank,
+    save_comparison_panel,
     save_preview_png,
     vst_inverse,
 )
@@ -228,23 +229,28 @@ def rtv_regularizer(torch, F, x, radius: int = 2, sigma: float = 2.0, eps: float
 
 
 def compute_training_loss(torch, F, pred, target, args: argparse.Namespace) -> tuple[object, dict[str, float]]:
-    """Compute the selected Pixel2Pixel training loss in FP32."""
+    """Compute the main Pixel2Pixel loss plus optional RTV in FP32."""
 
     if args.loss == "mse":
-        mse = F.mse_loss(pred.float(), target.float())
-        return mse, {"mse": float(mse.detach().cpu())}
+        main = F.mse_loss(pred.float(), target.float())
+        parts = {"mse": float(main.detach().cpu())}
+    elif args.loss == "charbonnier":
+        main = charbonnier_loss(torch, pred, target, args.charbonnier_eps)
+        parts = {"charbonnier": float(main.detach().cpu())}
+    else:
+        raise ValueError(f"Unknown loss: {args.loss}")
 
-    if args.loss == "charbonnier_rtv":
-        charb = charbonnier_loss(torch, pred, target, args.charbonnier_eps)
+    total = main
+    if args.rtv_weight > 0:
         rtv = rtv_regularizer(torch, F, pred, radius=args.rtv_radius, sigma=args.rtv_sigma, eps=args.rtv_eps)
-        loss = charb + args.rtv_weight * rtv
-        return loss, {
-            "charbonnier": float(charb.detach().cpu()),
-            "rtv": float(rtv.detach().cpu()),
-            "rtv_weighted": float((args.rtv_weight * rtv).detach().cpu()),
-        }
+        weighted = args.rtv_weight * rtv
+        total = total + weighted
+        parts["rtv"] = float(rtv.detach().cpu())
+        parts["rtv_weighted"] = float(weighted.detach().cpu())
+    else:
+        parts["rtv_weighted"] = 0.0
 
-    raise ValueError(f"Unknown loss: {args.loss}")
+    return total, parts
 
 
 def infer_full_image(torch, model, image: np.ndarray, device: str) -> np.ndarray:
@@ -264,7 +270,7 @@ def build_bank_for_image(args: argparse.Namespace, path: Path, image: np.ndarray
     cache_name = (
         f"{path.stem}_bank_k{args.bank_size}_p{args.bank_patch_size}_"
         f"sig{args.match_sigma}_pw{args.patch_weight}_sw{args.stats_weight}_"
-        f"gw{args.grad_weight}_ex{args.exclude_radius}.npz"
+        f"gw{args.grad_weight}_ex{args.exclude_radius}_pool{args.candidate_pool_size}.npz"
     )
     cache_path = args.out / "banks" / cache_name
     if args.reuse_bank and cache_path.exists():
@@ -286,7 +292,16 @@ def build_bank_for_image(args: argparse.Namespace, path: Path, image: np.ndarray
         exclude_radius = int(args.exclude_radius)
         acf = {}
 
-    print(f"building bank for {path.name}: K={args.bank_size}, exclude_radius={exclude_radius}")
+    n_pixels = image.size
+    candidate_indices = None
+    if args.candidate_pool_size > 0 and args.candidate_pool_size < n_pixels:
+        seed_offset = sum(bytearray(path.name.encode("utf-8")))
+        rng = np.random.default_rng(args.seed + seed_offset)
+        candidate_indices = rng.choice(n_pixels, size=args.candidate_pool_size, replace=False)
+        candidate_indices.sort()
+
+    pool_text = "full" if candidate_indices is None else str(candidate_indices.size)
+    print(f"building bank for {path.name}: K={args.bank_size}, exclude_radius={exclude_radius}, candidates={pool_text}")
     features = extract_pixel_features(
         image,
         patch_size=args.bank_patch_size,
@@ -304,6 +319,7 @@ def build_bank_for_image(args: argparse.Namespace, path: Path, image: np.ndarray
         max_query=args.max_query,
         chunk_size=args.bank_chunk_size,
         workers=args.workers,
+        candidate_indices=candidate_indices,
     )
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,6 +327,7 @@ def build_bank_for_image(args: argparse.Namespace, path: Path, image: np.ndarray
         cache_path,
         bank=bank,
         bank_dist=bank_dist,
+        candidate_indices=np.array([], dtype=np.int64) if candidate_indices is None else candidate_indices,
         exclude_radius=np.array(exclude_radius, dtype=np.int32),
         acf=json.dumps(acf),
     )
@@ -380,6 +397,7 @@ def save_artifacts(
     args: argparse.Namespace,
     state: VSTState,
     items: list[BankItem],
+    raw_images: list[np.ndarray],
     history: list[dict[str, float]],
     tag: str,
 ) -> None:
@@ -401,12 +419,13 @@ def save_artifacts(
     )
 
     was_training = model.training
-    for item in items:
+    for item, raw_image in zip(items, raw_images):
         pred_norm = infer_full_image(torch, model, item.image, args.device)
         pred_raw = vst_inverse(pred_norm, state).astype(np.float32)
         name = "pixel2pixel_denoised" if tag == "final" else f"pixel2pixel_{tag}"
         np.save(out_dir / f"{item.path.stem}_{name}.npy", pred_raw)
         save_preview_png(out_dir / f"{item.path.stem}_{name}.png", pred_raw)
+        save_comparison_panel(out_dir / f"{item.path.stem}_{name}_comparison.png", raw_image, pred_raw)
     if was_training:
         model.train()
 
@@ -429,8 +448,14 @@ def train(args: argparse.Namespace) -> None:
     if not input_paths:
         raise ValueError("No input images found.")
     raw_images = [np.load(path).astype(np.float32) for path in input_paths]
-    if len({image.shape for image in raw_images}) != 1:
-        raise ValueError("All input images must have the same shape.")
+    too_small = [
+        f"{path} {image.shape}"
+        for path, image in zip(input_paths, raw_images)
+        if image.shape[0] < args.train_patch_size or image.shape[1] < args.train_patch_size
+    ]
+    if too_small:
+        joined = ", ".join(too_small)
+        raise ValueError(f"These inputs are smaller than --train-patch-size={args.train_patch_size}: {joined}")
     images, state = fit_vst_normalization(raw_images, transform=args.transform)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -477,9 +502,9 @@ def train(args: argparse.Namespace) -> None:
             print(f"step {step + 1}/{args.steps} loss={item['loss']:.6f} {loss_text} grad={grad_norm:.3f} skipped={int(skipped)}")
 
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
-            save_artifacts(torch, nn, model, args, state, items, history, tag=f"step{step + 1}")
+            save_artifacts(torch, nn, model, args, state, items, raw_images, history, tag=f"step{step + 1}")
 
-    save_artifacts(torch, nn, model, args, state, items, history, tag="final")
+    save_artifacts(torch, nn, model, args, state, items, raw_images, history, tag="final")
 
 
 def parse_args() -> argparse.Namespace:
@@ -505,6 +530,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-multiplier", type=int, default=8)
     parser.add_argument("--max-query", type=int, default=2048)
     parser.add_argument("--bank-chunk-size", type=int, default=2048)
+    parser.add_argument("--candidate-pool-size", type=int, default=0, help="Use a random candidate subset for faster high-resolution bank search; 0 means exact full-image candidates.")
     parser.add_argument("--workers", type=int, default=-1)
     parser.add_argument("--reuse-bank", action="store_true")
 
@@ -520,7 +546,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--max-consecutive-skips", type=int, default=20)
-    parser.add_argument("--loss", choices=["charbonnier_rtv", "mse"], default="charbonnier_rtv")
+    parser.add_argument("--loss", choices=["charbonnier", "mse"], default="charbonnier")
     parser.add_argument("--charbonnier-eps", type=float, default=1e-3)
     parser.add_argument("--rtv-weight", type=float, default=0.01)
     parser.add_argument("--rtv-radius", type=int, default=2)

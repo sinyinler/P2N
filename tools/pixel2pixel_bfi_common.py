@@ -178,6 +178,7 @@ def query_pixel_bank(
     chunk_size: int = 2048,
     workers: int = -1,
     query_indices: np.ndarray | None = None,
+    candidate_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Find a non-local pixel bank for selected pixels.
 
@@ -194,13 +195,20 @@ def query_pixel_bank(
         query_indices = np.arange(n_pixels, dtype=np.int64)
     else:
         query_indices = np.asarray(query_indices, dtype=np.int64)
+    if candidate_indices is None:
+        candidate_indices = np.arange(n_pixels, dtype=np.int64)
+    else:
+        candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+        if candidate_indices.size < k:
+            raise ValueError(f"Candidate pool size {candidate_indices.size} is smaller than K={k}.")
 
     coords = np.column_stack(np.unravel_index(np.arange(n_pixels), shape)).astype(np.int32)
-    tree = cKDTree(features)
+    tree = cKDTree(features[candidate_indices])
     bank = np.empty((len(query_indices), k), dtype=np.int64)
     bank_dist = np.empty((len(query_indices), k), dtype=np.float32)
 
-    base_query = min(n_pixels, max(k + 1, k * query_multiplier))
+    n_candidates = int(candidate_indices.size)
+    base_query = min(n_candidates, max(k + 1, k * query_multiplier))
     for start in range(0, len(query_indices), chunk_size):
         end = min(start + chunk_size, len(query_indices))
         current = query_indices[start:end]
@@ -208,10 +216,11 @@ def query_pixel_bank(
         query_k = base_query
 
         while not np.all(filled):
-            distances, indices = tree.query(features[current], k=min(query_k, n_pixels), workers=workers)
+            distances, local_indices = tree.query(features[current], k=min(query_k, n_candidates), workers=workers)
             if distances.ndim == 1:
                 distances = distances[:, None]
-                indices = indices[:, None]
+                local_indices = local_indices[:, None]
+            indices = candidate_indices[local_indices]
 
             for row, global_index in enumerate(current):
                 if filled[row]:
@@ -230,7 +239,7 @@ def query_pixel_bank(
 
             if np.all(filled):
                 break
-            if query_k >= min(max_query, n_pixels):
+            if query_k >= min(max_query, n_candidates):
                 # Extremely small images or very large exclusion radii may not
                 # have enough candidates. Repeat the available candidates rather
                 # than silently changing K.
@@ -250,7 +259,7 @@ def query_pixel_bank(
                     bank[start + row] = np.tile(candidate_idx, repeats)[:k]
                     bank_dist[start + row] = np.tile(candidate_dist, repeats)[:k]
                 break
-            query_k = min(query_k * 2, max_query, n_pixels)
+            query_k = min(query_k * 2, max_query, n_candidates)
 
     return bank, bank_dist
 
@@ -265,3 +274,35 @@ def save_preview_png(path: Path, image: np.ndarray) -> None:
         scaled = np.clip((image - lo) / (hi - lo), 0, 1)
         scaled = (scaled * 255.0 + 0.5).astype(np.uint8)
     Image.fromarray(scaled).save(path)
+
+
+def save_comparison_panel(path: Path, noisy: np.ndarray, denoised: np.ndarray) -> None:
+    """Save noisy gray, denoised gray, and denoised jet views in one image."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    finite = np.isfinite(np.concatenate([noisy.ravel(), denoised.ravel()]))
+    joined = np.concatenate([noisy.ravel(), denoised.ravel()])[finite]
+    if joined.size == 0:
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin, vmax = np.percentile(joined, [0.5, 99.5])
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True)
+    axes[0].imshow(noisy, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[0].set_title("noisy")
+    axes[1].imshow(denoised, cmap="gray", vmin=vmin, vmax=vmax)
+    axes[1].set_title("denoised gray")
+    im = axes[2].imshow(denoised, cmap="jet", vmin=vmin, vmax=vmax)
+    axes[2].set_title("denoised jet")
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
